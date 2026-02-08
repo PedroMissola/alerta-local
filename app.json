@@ -26,7 +26,7 @@
     },
     "android": {
       "adaptiveIcon": {
-        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "foregroundImage": "./assets/images/icon.png",
         "backgroundColor": "#ffffff"
       },
       "package": "com.pedromissola.alertalocal",
@@ -38,7 +38,12 @@
         "FOREGROUND_SERVICE_LOCATION",
         "POST_NOTIFICATIONS",
         "WAKE_LOCK",
-        "VIBRATE"
+        "VIBRATE",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_LOCATION"
       ]
     },
     "web": {
@@ -60,7 +65,7 @@
       [
         "expo-notifications",
         {
-          "icon": "./assets/images/notification-icon.png",
+          "icon": "./assets/images/icon.png",
           "color": "#2196F3",
           "sounds": [
             "./assets/sounds/chime.mp3"
@@ -70,6 +75,12 @@
     ],
     "experiments": {
       "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "b78fdb66-5465-46db-8c4f-cb5d1f62fafe"
+      }
     }
   }
 }

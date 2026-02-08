@@ -1,6 +1,6 @@
 import { Audio } from 'expo-av';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Vibration, Platform } from 'react-native';
+import { Platform, Vibration } from 'react-native';
 
 export type AudioOutput = 'default' | 'speaker' | 'headphones' | 'off';
 
@@ -162,9 +162,9 @@ export function useAlarmSystem() {
 
       soundPoolRef.current.currentAlarm = sound;
 
-      // Toca e agenda parada após 8 segundos
+      // Toca e agenda parada após 10 segundos
       await sound.playAsync();
-      scheduleStop(sound, 8000);
+      scheduleStop(sound, 10000);
     } catch (error) {
       console.error('[AlarmSystem] Erro ao tocar alarme:', error);
     }
