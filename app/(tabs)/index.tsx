@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, View, Alert, TouchableWithoutFeedback } from 'react-native';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { StyleSheet, View, Alert, TouchableWithoutFeedback, Vibration } from 'react-native';
 import { WebView } from 'react-native-webview'; 
 import * as Location from 'expo-location';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -8,8 +8,23 @@ import { useLocalSearchParams } from 'expo-router';
 import { ControlPanel } from '@/components/ControlPanel';
 import { useAlarmSystem } from '@/hooks/useAlarmSystem';
 import { DatabaseService } from '@/services/database';
+import {
+  ProximityDetector,
+  ProximityConfig,
+  saveProximityConfig,
+  clearProximityData,
+  Coordinates,
+} from '@/services/proximityService';
+import {
+  startBackgroundMonitoring,
+  stopBackgroundMonitoring,
+  requestNotificationPermissions,
+} from '@/services/backgroundTask';
 
-// O HTML do Leaflet continua o mesmo de antes...
+// ============================================================
+// HTML DO MAPA (LEAFLET)
+// ============================================================
+
 const LEAFLET_HTML = `
 <!DOCTYPE html>
 <html>
@@ -59,7 +74,6 @@ const LEAFLET_HTML = `
         targetCircle = L.circle([lat, lng], {
           color: 'red', fillColor: '#f03', fillOpacity: 0.2, radius: radius || 500
         }).addTo(map);
-        // Centraliza o mapa no novo alvo
         map.setView([lat, lng], 16);
       }
     };
@@ -74,182 +88,342 @@ const LEAFLET_HTML = `
 </html>
 `;
 
+// ============================================================
+// COMPONENTE PRINCIPAL
+// ============================================================
+
 export default function HomeScreen() {
   const params = useLocalSearchParams();
-  const webViewRef = useRef<WebView>(null); 
+  const webViewRef = useRef<WebView>(null);
 
-  const [location, setLocation] = useState<Location.LocationObjectCoords | null>(null);
-  const [target, setTarget] = useState<{latitude: number, longitude: number} | null>(null);
+  // --- ESTADOS ---
+  const [location, setLocation] = useState<Coordinates | null>(null);
+  const [target, setTarget] = useState<Coordinates | null>(null);
   const [distance, setDistance] = useState<number>(0);
   
   const [radiusInput, setRadiusInput] = useState('500');
   const [intervalInput, setIntervalInput] = useState('100');
   const [isMonitoring, setIsMonitoring] = useState(false);
-  const [isPanelExpanded, setIsPanelExpanded] = useState(true); 
-  const [isSearching, setIsSearching] = useState(false); // NOVO STATE
+  const [isPanelExpanded, setIsPanelExpanded] = useState(true);
+  const [isSearching, setIsSearching] = useState(false);
 
+  // --- HOOKS ---
   const { playAlarm, playChime, audioOutput, setAudioOutput } = useAlarmSystem();
-  const hasEnteredZoneRef = useRef(false);
-  const lastAlertDistanceRef = useRef<number | null>(null);
+  
+  // Detector de proximidade para foreground
+  const detectorRef = useRef(new ProximityDetector());
+
+  // ============================================================
+  // INICIALIZAÇÃO
+  // ============================================================
 
   useEffect(() => {
-    try { DatabaseService.init(); } catch (e) { console.log("Erro DB", e); }
+    // Inicializa banco de dados
+    try {
+      DatabaseService.init();
+    } catch (e) {
+      console.error('[HomeScreen] Erro ao iniciar DB:', e);
+    }
+
+    // Solicita permissão de notificações
+    requestNotificationPermissions();
   }, []);
 
-  useEffect(() => {
-    if (params.lat && params.lng) {
-        const lat = parseFloat(params.lat as string);
-        const lng = parseFloat(params.lng as string);
-        const rad = params.rad as string;
-        const int = params.int as string;
-        const name = params.name as string;
+  // ============================================================
+  // CONTROLE DE ALVO
+  // ============================================================
 
-        handleNewTarget(lat, lng, parseInt(rad)); 
-        setRadiusInput(rad);
-        setIntervalInput(int);
-        setIsPanelExpanded(false);
-        Alert.alert("Local Carregado", `Alvo definido para: ${name}`);
+  /**
+   * Define novo alvo no mapa e reseta monitoramento
+   */
+  const handleNewTarget = useCallback(async (lat: number, lng: number) => {
+    Vibration.vibrate(50);
+
+    const newTarget: Coordinates = { latitude: lat, longitude: lng };
+    setTarget(newTarget);
+
+    // Atualiza visual do mapa
+    const radius = parseInt(radiusInput) || 500;
+    webViewRef.current?.injectJavaScript(
+      `window.updateTarget(${lat}, ${lng}, ${radius}); true;`
+    );
+
+    // Salva configuração para background
+    const config: ProximityConfig = {
+      targetCoords: newTarget,
+      radius,
+      interval: parseInt(intervalInput) || 100,
+    };
+    await saveProximityConfig(config);
+
+    // Reseta detector foreground
+    detectorRef.current.reset();
+
+    // Para monitoramento se estiver ativo
+    if (isMonitoring) {
+      await stopMonitoringInternal();
     }
-  }, [params]);
+
+    setIsPanelExpanded(true);
+  }, [radiusInput, intervalInput, isMonitoring]);
+
+  // ============================================================
+  // ATUALIZAÇÃO DE CONFIGURAÇÕES
+  // ============================================================
+
+  /**
+   * Atualiza raio e intervalo no storage e mapa
+   */
+  useEffect(() => {
+    if (!target) return;
+
+    const updateConfig = async () => {
+      const config: ProximityConfig = {
+        targetCoords: target,
+        radius: parseInt(radiusInput) || 500,
+        interval: parseInt(intervalInput) || 100,
+      };
+      await saveProximityConfig(config);
+
+      // Atualiza visual
+      webViewRef.current?.injectJavaScript(
+        `window.updateTarget(${target.latitude}, ${target.longitude}, ${config.radius}); true;`
+      );
+    };
+
+    updateConfig();
+  }, [radiusInput, intervalInput, target]);
+
+  // ============================================================
+  // PARÂMETROS DE NAVEGAÇÃO (Tela "Salvos")
+  // ============================================================
+
+  useEffect(() => {
+    if (!params.lat || !params.lng) return;
+
+    const lat = parseFloat(params.lat as string);
+    const lng = parseFloat(params.lng as string);
+    const rad = params.rad as string;
+    const int = params.int as string;
+
+    // Evita loop se já é o mesmo alvo
+    if (target && 
+        Math.abs(target.latitude - lat) < 0.00001 && 
+        Math.abs(target.longitude - lng) < 0.00001) {
+      return;
+    }
+
+    // Atualiza
+    setRadiusInput(rad);
+    setIntervalInput(int);
+    handleNewTarget(lat, lng);
+    setIsPanelExpanded(false);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params.lat, params.lng, params.rad, params.int]);
+
+  // ============================================================
+  // GPS FOREGROUND
+  // ============================================================
 
   useEffect(() => {
     let subscription: Location.LocationSubscription | null = null;
-    (async () => {
-      let { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') return Alert.alert('Permissão negada', 'Precisamos do GPS.');
+
+    const startGPS = async () => {
+      // Permissão foreground
+      const { status: fgStatus } = await Location.requestForegroundPermissionsAsync();
+      if (fgStatus !== 'granted') {
+        Alert.alert('Erro', 'Permissão de GPS é necessária');
+        return;
+      }
+
+      // Permissão background (avisa mas não bloqueia)
+      const { status: bgStatus } = await Location.requestBackgroundPermissionsAsync();
+      if (bgStatus !== 'granted') {
+        Alert.alert(
+          'Atenção',
+          'Sem permissão de localização "Permitir o Tempo Todo", o alarme pode não funcionar com a tela bloqueada.'
+        );
+      }
+
+      // Inicia monitoramento
       subscription = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.High, distanceInterval: 5 },
+        { 
+          accuracy: Location.Accuracy.High, 
+          distanceInterval: 5 
+        },
         (newLoc) => {
-          setLocation(newLoc.coords);
+          const coords: Coordinates = {
+            latitude: newLoc.coords.latitude,
+            longitude: newLoc.coords.longitude,
+          };
+          setLocation(coords);
+
+          // Atualiza bolinha azul no mapa
           webViewRef.current?.injectJavaScript(
-            `window.updateUserPosition(${newLoc.coords.latitude}, ${newLoc.coords.longitude}); true;`
+            `window.updateUserPosition(${coords.latitude}, ${coords.longitude}); true;`
           );
         }
       );
-    })();
-    return () => { subscription?.remove(); };
+    };
+
+    startGPS();
+
+    return () => {
+      subscription?.remove();
+    };
   }, []);
 
-  useEffect(() => {
-    if (target) {
-       webViewRef.current?.injectJavaScript(
-         `window.updateTarget(${target.latitude}, ${target.longitude}, ${parseInt(radiusInput) || 500}); true;`
-       );
-    }
-  }, [radiusInput]); 
+  // ============================================================
+  // LÓGICA DE PROXIMIDADE (FOREGROUND)
+  // ============================================================
 
   useEffect(() => {
-    if (location && target && isMonitoring) checkProximity(location);
-  }, [location, target, isMonitoring]);
+    if (!location || !target || !isMonitoring) return;
 
-  const getDistanceInMeters = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-    const R = 6371e3;
-    const toRad = (v: number) => (v * Math.PI) / 180;
-    const a = Math.sin(toRad(lat2 - lat1) / 2) ** 2 +
-              Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-              Math.sin(toRad(lon2 - lon1) / 2) ** 2;
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  };
+    const config: ProximityConfig = {
+      targetCoords: target,
+      radius: parseInt(radiusInput) || 500,
+      interval: parseInt(intervalInput) || 100,
+    };
 
-  const checkProximity = (currentCoords: Location.LocationObjectCoords) => {
-    if (!target) return;
-    const dist = Math.round(getDistanceInMeters(currentCoords.latitude, currentCoords.longitude, target.latitude, target.longitude));
+    const { distance: dist, event } = detectorRef.current.checkPosition(location, config);
     setDistance(dist);
 
-    const radius = parseInt(radiusInput) || 500;
-    const interval = parseInt(intervalInput) || 100;
+    // Dispara som/vibração se houver evento
+    if (event) {
+      switch (event.type) {
+        case 'ZONE_ENTERED':
+          console.log('[HomeScreen] Entrou na zona!');
+          playAlarm();
+          break;
 
-    if (dist <= radius) {
-      if (!hasEnteredZoneRef.current) {
-        hasEnteredZoneRef.current = true;
-        lastAlertDistanceRef.current = dist;
-        playAlarm();
-      } else if (lastAlertDistanceRef.current !== null && (lastAlertDistanceRef.current - dist) >= interval) {
-        lastAlertDistanceRef.current = dist;
-        playChime();
+        case 'INTERVAL_CROSSED':
+          console.log(`[HomeScreen] Intervalo cruzado: ${event.delta}m`);
+          playChime();
+          break;
+
+        case 'ZONE_EXITED':
+          console.log('[HomeScreen] Saiu da zona');
+          break;
       }
-    } else {
-      hasEnteredZoneRef.current = false;
-      lastAlertDistanceRef.current = null;
+    }
+  }, [location, target, isMonitoring, radiusInput, intervalInput, playAlarm, playChime]);
+
+  // ============================================================
+  // CONTROLE DE MONITORAMENTO
+  // ============================================================
+
+  const startMonitoringInternal = async () => {
+    if (!target) {
+      Alert.alert('Erro', 'Marque um ponto no mapa primeiro');
+      return;
+    }
+
+    // Reseta detector
+    detectorRef.current.reset();
+
+    // Inicia background task
+    try {
+      await startBackgroundMonitoring();
+      setIsMonitoring(true);
+      setIsPanelExpanded(false);
+      console.log('[HomeScreen] Monitoramento iniciado');
+    } catch (error) {
+      console.error('[HomeScreen] Erro ao iniciar:', error);
+      Alert.alert('Erro', 'Não foi possível iniciar o monitoramento');
     }
   };
+
+  const stopMonitoringInternal = async () => {
+    try {
+      await stopBackgroundMonitoring();
+      await clearProximityData();
+      detectorRef.current.reset();
+      setIsMonitoring(false);
+      console.log('[HomeScreen] Monitoramento parado');
+    } catch (error) {
+      console.error('[HomeScreen] Erro ao parar:', error);
+    }
+  };
+
+  const toggleMonitoring = () => {
+    if (isMonitoring) {
+      stopMonitoringInternal();
+    } else {
+      startMonitoringInternal();
+    }
+  };
+
+  // ============================================================
+  // HANDLERS DE UI
+  // ============================================================
 
   const handleWebViewMessage = (event: any) => {
     try {
       const data = JSON.parse(event.nativeEvent.data);
       if (data.type === 'MAP_CLICK') {
-        handleNewTarget(data.lat, data.lng, parseInt(radiusInput));
+        handleNewTarget(data.lat, data.lng);
       }
-    } catch (e) { console.log("Erro msg webview", e); }
-  };
-
-  const handleNewTarget = (lat: number, lng: number, radius: number) => {
-    setTarget({ latitude: lat, longitude: lng });
-    webViewRef.current?.injectJavaScript(
-      `window.updateTarget(${lat}, ${lng}, ${radius || 500}); true;`
-    );
-    setIsMonitoring(false);
-    hasEnteredZoneRef.current = false;
-    lastAlertDistanceRef.current = null;
-    // setIsPanelExpanded(true); // Opcional: manter aberto ou fechar
-  };
-
-  const toggleMonitoring = () => {
-    if (!target) return Alert.alert('Erro', 'Marque um ponto no mapa.');
-    const novoEstado = !isMonitoring;
-    setIsMonitoring(novoEstado);
-    if (!novoEstado) {
-      hasEnteredZoneRef.current = false;
-      lastAlertDistanceRef.current = null;
-    } else {
-      setIsPanelExpanded(false);
+    } catch (e) {
+      console.error('[HomeScreen] Erro ao processar mensagem WebView:', e);
     }
   };
 
   const handleSaveToDB = (name: string) => {
     if (!target) return;
+
     try {
-        DatabaseService.addAlert(name, target.latitude, target.longitude, parseInt(radiusInput), parseInt(intervalInput));
-        Alert.alert("Sucesso", "Local salvo!");
-    } catch (e) { Alert.alert("Erro", "Falha ao salvar."); }
-  };
-
-  // --- NOVA FUNÇÃO DE BUSCA ---
-  const handleSearchAddress = async (query: string) => {
-    setIsSearching(true);
-    try {
-        // Tenta ver se é coordenada direta (Ex: -23.5, -46.6)
-        const coords = query.split(',').map(s => parseFloat(s.trim()));
-        if (coords.length === 2 && !isNaN(coords[0]) && !isNaN(coords[1])) {
-            handleNewTarget(coords[0], coords[1], parseInt(radiusInput));
-            Alert.alert("Coordenada", "Local definido manualmente.");
-            setIsSearching(false);
-            return;
-        }
-
-        // Se não for coordenada, busca no Nominatim
-        // IMPORTANTE: O User-Agent é obrigatório pela política do OSM
-        const response = await fetch(
-            `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`, 
-            { headers: { 'User-Agent': 'AlertaLocalApp/1.0' } }
-        );
-        const data = await response.json();
-
-        if (data && data.length > 0) {
-            const firstResult = data[0];
-            const lat = parseFloat(firstResult.lat);
-            const lon = parseFloat(firstResult.lon);
-            handleNewTarget(lat, lon, parseInt(radiusInput));
-            Alert.alert("Encontrado", firstResult.display_name);
-        } else {
-            Alert.alert("Ops", "Nenhum local encontrado.");
-        }
-    } catch (error) {
-        Alert.alert("Erro", "Falha na busca. Verifique sua internet.");
-    } finally {
-        setIsSearching(false);
+      DatabaseService.addAlert(
+        name,
+        target.latitude,
+        target.longitude,
+        parseInt(radiusInput),
+        parseInt(intervalInput)
+      );
+      Alert.alert('Sucesso', 'Local salvo!');
+    } catch (e) {
+      console.error('[HomeScreen] Erro ao salvar:', e);
+      Alert.alert('Erro', 'Falha ao salvar');
     }
   };
+
+  const handleSearchAddress = async (query: string) => {
+    setIsSearching(true);
+
+    try {
+      // Tenta interpretar como coordenada manual
+      const coords = query.split(',').map(s => parseFloat(s.trim()));
+      if (coords.length === 2 && !isNaN(coords[0]) && !isNaN(coords[1])) {
+        await handleNewTarget(coords[0], coords[1]);
+        Alert.alert('Coordenada', 'Local definido manualmente');
+        return;
+      }
+
+      // Busca no Nominatim (OpenStreetMap)
+      const response = await fetch(
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`,
+        { headers: { 'User-Agent': 'AlertaLocalApp/1.0' } }
+      );
+      const data = await response.json();
+
+      if (data && data.length > 0) {
+        const result = data[0];
+        await handleNewTarget(parseFloat(result.lat), parseFloat(result.lon));
+        Alert.alert('Encontrado', result.display_name);
+      } else {
+        Alert.alert('Ops', 'Nenhum local encontrado');
+      }
+    } catch (error) {
+      console.error('[HomeScreen] Erro na busca:', error);
+      Alert.alert('Erro', 'Falha na busca. Verifique sua internet.');
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  // ============================================================
+  // RENDER
+  // ============================================================
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -260,8 +434,8 @@ export default function HomeScreen() {
           source={{ html: LEAFLET_HTML }}
           style={styles.map}
           onMessage={handleWebViewMessage}
-          javaScriptEnabled={true}
-          domStorageEnabled={true}
+          javaScriptEnabled
+          domStorageEnabled
         />
       </View>
 
@@ -271,16 +445,20 @@ export default function HomeScreen() {
         </TouchableWithoutFeedback>
       )}
 
-      <ControlPanel 
-        radius={radiusInput} setRadius={setRadiusInput}
-        interval={intervalInput} setInterval={setIntervalInput}
-        isMonitoring={isMonitoring} onToggleMonitoring={toggleMonitoring}
-        distance={distance} hasTarget={!!target}
-        audioOutput={audioOutput} setAudioOutput={setAudioOutput}
+      <ControlPanel
+        radius={radiusInput}
+        setRadius={setRadiusInput}
+        interval={intervalInput}
+        setInterval={setIntervalInput}
+        isMonitoring={isMonitoring}
+        onToggleMonitoring={toggleMonitoring}
+        distance={distance}
+        hasTarget={!!target}
+        audioOutput={audioOutput}
+        setAudioOutput={setAudioOutput}
         isExpanded={isPanelExpanded}
         onToggleExpand={() => setIsPanelExpanded(!isPanelExpanded)}
         onSave={handleSaveToDB}
-        // NOVAS PROPS
         onSearchAddress={handleSearchAddress}
         isSearching={isSearching}
       />
@@ -288,13 +466,25 @@ export default function HomeScreen() {
   );
 }
 
+// ============================================================
+// ESTILOS
+// ============================================================
+
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#fff' },
-  mapContainer: { flex: 1 },
-  map: { flex: 1, backgroundColor: '#eee' }, 
+  container: {
+    flex: 1,
+    backgroundColor: '#fff',
+  },
+  mapContainer: {
+    flex: 1,
+  },
+  map: {
+    flex: 1,
+    backgroundColor: '#eee',
+  },
   backdrop: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(0,0,0,0.4)',
     zIndex: 1,
-  }
+  },
 });

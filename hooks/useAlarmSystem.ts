@@ -1,12 +1,15 @@
 import { Audio } from 'expo-av';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Vibration } from 'react-native';
+import { Vibration, Platform } from 'react-native';
 
-export type AudioOutput = 'default' | 'speaker';
+export type AudioOutput = 'default' | 'speaker' | 'headphones' | 'off';
 
-// Lista de sons longos. Adicione todos os seus sons da pasta /assets/sounds/longs/ aqui.
-// O Metro Bundler (usado pelo Expo) precisa saber de todos os assets em tempo de compilação.
-const longAlarmSounds = [
+interface SoundPool {
+  chime: Audio.Sound | null;
+  currentAlarm: Audio.Sound | null;
+}
+
+const ALARM_SOUNDS = [
   require('@/assets/sounds/longs/long_alarm_1.mp3'),
   require('@/assets/sounds/longs/long_alarm_2.mp3'),
   require('@/assets/sounds/longs/long_alarm_3.mp3'),
@@ -15,97 +18,200 @@ const longAlarmSounds = [
   require('@/assets/sounds/longs/long_alarm_6.mp3'),
 ];
 
+const CHIME_SOUND = require('@/assets/sounds/chime.mp3');
+
 export function useAlarmSystem() {
   const [audioOutput, setAudioOutput] = useState<AudioOutput>('default');
-  const chimeSoundRef = useRef<Audio.Sound | null>(null);
-  const currentAlarmSoundRef = useRef<Audio.Sound | null>(null); // Ref para o som de alarme carregado
+  const soundPoolRef = useRef<SoundPool>({ chime: null, currentAlarm: null });
   
-  // Para controlar o tempo de parada (setTimeout em RN retorna um number)
-  const stopTimerRef = useRef<number | null>(null);
+  // Timer para auto-parar sons (corrigido para React Native)
+  const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const configureAudio = useCallback(async (output: AudioOutput) => {
+  const configureAudioMode = useCallback(async (output: AudioOutput) => {
+    if (output === 'off') return;
+
     try {
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: false,
         staysActiveInBackground: true,
         playsInSilentModeIOS: true,
         shouldDuckAndroid: true,
-        playThroughEarpieceAndroid: output !== 'speaker',
+        playThroughEarpieceAndroid: output === 'headphones',
+        ...(Platform.OS === 'ios' && output === 'speaker' && {
+          // Força alto-falante no iOS
+          playsInSilentModeIOS: true,
+        }),
       });
-    } catch (e) { console.log('Erro ao configurar áudio:', e); }
+    } catch (error) {
+      console.error('[AlarmSystem] Erro ao configurar áudio:', error);
+    }
   }, []);
+
+  // ============================================================
+  // CARREGAMENTO DE SONS
+  // ============================================================
 
   const loadSounds = useCallback(async () => {
     try {
-      // Carrega o som de sino a partir dos assets locais
+      // Carrega sino (loop)
       const { sound: chime } = await Audio.Sound.createAsync(
-        require('@/assets/sounds/chime.mp3'), // ATENÇÃO: Verifique se o caminho está correto
-        { isLooping: true }
+        CHIME_SOUND,
+        { isLooping: true, volume: 1.0 }
       );
-      chimeSoundRef.current = chime;
-    } catch (error) { console.log('Erro ao carregar som de sino:', error); }
+      soundPoolRef.current.chime = chime;
+    } catch (error) {
+      console.error('[AlarmSystem] Erro ao carregar sons:', error);
+    }
   }, []);
 
-  // Efeito para carregar sons na montagem e descarregar na desmontagem
+  // ============================================================
+  // CLEANUP GERAL
+  // ============================================================
+
+  const cleanupSounds = useCallback(async () => {
+    const { chime, currentAlarm } = soundPoolRef.current;
+
+    try {
+      if (chime) {
+        await chime.stopAsync();
+        await chime.unloadAsync();
+      }
+      if (currentAlarm) {
+        await currentAlarm.stopAsync();
+        await currentAlarm.unloadAsync();
+      }
+    } catch (error) {
+      console.error('[AlarmSystem] Erro ao limpar sons:', error);
+    }
+
+    soundPoolRef.current = { chime: null, currentAlarm: null };
+
+    if (stopTimerRef.current) {
+      clearTimeout(stopTimerRef.current);
+      stopTimerRef.current = null;
+    }
+  }, []);
+
+  // ============================================================
+  // EFEITOS
+  // ============================================================
+
+  // Inicialização
   useEffect(() => {
     loadSounds();
     return () => {
-      if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
-      chimeSoundRef.current?.unloadAsync();
-      currentAlarmSoundRef.current?.unloadAsync(); // Garante que o alarme atual seja descarregado
+      cleanupSounds();
     };
-  }, [loadSounds]);
+  }, [loadSounds, cleanupSounds]);
 
-  // Efeito para reconfigurar o áudio quando a saída mudar
+  // Atualiza modo de áudio quando output muda
   useEffect(() => {
-    configureAudio(audioOutput);
-  }, [audioOutput, configureAudio]);
+    configureAudioMode(audioOutput);
+  }, [audioOutput, configureAudioMode]);
 
-  // Função auxiliar para parar sons após X tempo
-  const stopAfter = useCallback((sound: Audio.Sound, durationMs: number) => {
-    if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+  // ============================================================
+  // HELPER: PARAR SOM APÓS TIMEOUT
+  // ============================================================
+
+  const scheduleStop = useCallback((sound: Audio.Sound, durationMs: number) => {
+    // Limpa timer anterior
+    if (stopTimerRef.current) {
+      clearTimeout(stopTimerRef.current);
+    }
 
     stopTimerRef.current = setTimeout(async () => {
       try {
-        await sound.stopAsync();
-      } catch (e) { console.log('Erro ao parar som:', e); }
+        const status = await sound.getStatusAsync();
+        if (status.isLoaded && status.isPlaying) {
+          await sound.stopAsync();
+        }
+      } catch (error) {
+        console.error('[AlarmSystem] Erro ao parar som:', error);
+      }
     }, durationMs);
   }, []);
 
+  // ============================================================
+  // TOCAR ALARME LONGO
+  // ============================================================
+
   const playAlarm = useCallback(async () => {
-    console.log("🔊 ALARME (8 segundos)");
-    Vibration.vibrate([0, 1000, 500, 1000, 500, 1000]); 
+    console.log('🔊 [AlarmSystem] Tocando ALARME');
+
+    // Vibração forte
+    Vibration.vibrate([0, 1000, 500, 1000, 500, 1000]);
+
+    if (audioOutput === 'off') {
+      console.log('🔇 [AlarmSystem] Áudio desabilitado');
+      return;
+    }
+
     try {
-      // 1. Descarrega o som anterior para liberar memória
-      if (currentAlarmSoundRef.current) {
-        await currentAlarmSoundRef.current.unloadAsync();
+      // Descarrega alarme anterior se existir
+      if (soundPoolRef.current.currentAlarm) {
+        await soundPoolRef.current.currentAlarm.stopAsync();
+        await soundPoolRef.current.currentAlarm.unloadAsync();
       }
 
-      // 2. Escolhe um som aleatório da lista
-      const randomIndex = Math.floor(Math.random() * longAlarmSounds.length);
-      const randomSoundSource = longAlarmSounds[randomIndex];
-
-      // 3. Carrega e toca o novo som
+      // Seleciona alarme aleatório
+      const randomIndex = Math.floor(Math.random() * ALARM_SOUNDS.length);
       const { sound } = await Audio.Sound.createAsync(
-        randomSoundSource,
-        { isLooping: true }
+        ALARM_SOUNDS[randomIndex],
+        { isLooping: true, volume: 1.0 }
       );
-      currentAlarmSoundRef.current = sound;
-      await sound.playFromPositionAsync(0);
-      stopAfter(sound, 8000); // Para após 8 segundos
-    } catch (e) { console.log('Erro ao tocar alarme:', e); }
-  }, [stopAfter]);
+
+      soundPoolRef.current.currentAlarm = sound;
+
+      // Toca e agenda parada após 8 segundos
+      await sound.playAsync();
+      scheduleStop(sound, 8000);
+    } catch (error) {
+      console.error('[AlarmSystem] Erro ao tocar alarme:', error);
+    }
+  }, [audioOutput, scheduleStop]);
+
+  // ============================================================
+  // TOCAR SINO (CHIME)
+  // ============================================================
 
   const playChime = useCallback(async () => {
-    console.log("🔔 SINO (3 segundos)");
-    Vibration.vibrate([0, 200, 100, 200]);
-    try {
-      if (chimeSoundRef.current) {
-        await chimeSoundRef.current.playFromPositionAsync(0);
-        stopAfter(chimeSoundRef.current, 3000); // Para após 3 segundos (entre 2 e 5)
-      }
-    } catch (e) { console.log('Erro ao tocar sino:', e); }
-  }, [stopAfter]);
+    console.log('🔔 [AlarmSystem] Tocando SINO');
 
-  return { playAlarm, playChime, audioOutput, setAudioOutput };
+    // Vibração curta
+    Vibration.vibrate([0, 200, 100, 200]);
+
+    if (audioOutput === 'off') {
+      console.log('🔇 [AlarmSystem] Áudio desabilitado');
+      return;
+    }
+
+    const { chime } = soundPoolRef.current;
+    if (!chime) {
+      console.warn('[AlarmSystem] Som de sino não carregado');
+      return;
+    }
+
+    try {
+      // Para e volta ao início
+      await chime.stopAsync();
+      await chime.setPositionAsync(0);
+      await chime.playAsync();
+
+      // Agenda parada após 3 segundos
+      scheduleStop(chime, 3000);
+    } catch (error) {
+      console.error('[AlarmSystem] Erro ao tocar sino:', error);
+    }
+  }, [audioOutput, scheduleStop]);
+
+  // ============================================================
+  // RETORNO
+  // ============================================================
+
+  return {
+    playAlarm,
+    playChime,
+    audioOutput,
+    setAudioOutput,
+  };
 }

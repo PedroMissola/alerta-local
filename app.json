@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "alerta-local",
+    "name": "Alerta Local",
     "slug": "alerta-local",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -13,7 +13,16 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.pedromissola.alertalocal",
+      "infoPlist": {
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "O Alerta Local precisa acessar sua localização em segundo plano para avisar quando você se aproximar do seu destino, mesmo com o app fechado ou a tela bloqueada.",
+        "NSLocationWhenInUseUsageDescription": "O Alerta Local precisa acessar sua localização para monitorar sua proximidade ao destino.",
+        "UIBackgroundModes": [
+          "location",
+          "audio"
+        ]
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -24,7 +33,12 @@
       "permissions": [
         "ACCESS_COARSE_LOCATION",
         "ACCESS_FINE_LOCATION",
-        "FOREGROUND_SERVICE" 
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "POST_NOTIFICATIONS",
+        "WAKE_LOCK",
+        "VIBRATE"
       ]
     },
     "web": {
@@ -37,7 +51,20 @@
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "Allow $(PRODUCT_NAME) to use your location."
+          "locationAlwaysAndWhenInUsePermission": "O Alerta Local precisa acessar sua localização em segundo plano para avisar quando você se aproximar do seu destino, mesmo com o app fechado ou a tela bloqueada.",
+          "locationWhenInUsePermission": "O Alerta Local precisa acessar sua localização para monitorar sua proximidade ao destino.",
+          "isAndroidBackgroundLocationEnabled": true,
+          "isAndroidForegroundServiceEnabled": true
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/images/notification-icon.png",
+          "color": "#2196F3",
+          "sounds": [
+            "./assets/sounds/chime.mp3"
+          ]
         }
       ]
     ],
